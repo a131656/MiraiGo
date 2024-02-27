@@ -3,6 +3,7 @@ package client
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"io"
 
 	"github.com/pkg/errors"
@@ -72,14 +73,13 @@ func (c *QQClient) UploadVoice(target message.Source, voice io.ReadSeeker) (*mes
 		ext = c.buildGroupPttStoreBDHExt(target.PrimaryID, fh, int32(length), 0, int32(length))
 	}
 	// multi-thread upload is no need
-	rsp, err := c.highwaySession.UploadBDH(highway.BdhInput{
+	rsp, err := c.highwaySession.Upload(highway.Transaction{
 		CommandID: cmd,
 		Body:      voice,
 		Sum:       fh,
 		Size:      length,
 		Ticket:    c.highwaySession.SigSession,
 		Ext:       ext,
-		Encrypt:   false,
 	})
 	if err != nil {
 		return nil, err
@@ -89,9 +89,9 @@ func (c *QQClient) UploadVoice(target message.Source, voice io.ReadSeeker) (*mes
 	}
 	ptt := &msg.Ptt{
 		FileType:  proto.Int32(4),
-		SrcUin:    &c.Uin,
+		SrcUin:    proto.Some(c.Uin),
 		FileMd5:   fh,
-		FileName:  proto.String(hex.EncodeToString(fh) + ".amr"),
+		FileName:  proto.String(fmt.Sprintf("%x.amr", fh)),
 		FileSize:  proto.Int32(int32(length)),
 		BoolValid: proto.Bool(true),
 	}
@@ -121,8 +121,7 @@ func (c *QQClient) UploadVoice(target message.Source, voice io.ReadSeeker) (*mes
 }
 
 // UploadShortVideo 将视频和封面上传到服务器, 返回 message.ShortVideoElement 可直接发送
-// thread 上传线程数
-func (c *QQClient) UploadShortVideo(target message.Source, video, thumb io.ReadSeeker, thread int) (*message.ShortVideoElement, error) {
+func (c *QQClient) UploadShortVideo(target message.Source, video, thumb io.ReadSeeker) (*message.ShortVideoElement, error) {
 	thumbHash := md5.New()
 	thumbLen, _ := io.Copy(thumbHash, thumb)
 	thumbSum := thumbHash.Sum(nil)
@@ -156,8 +155,10 @@ func (c *QQClient) UploadShortVideo(target message.Source, video, thumb io.ReadS
 		cmd = 89
 	}
 	ext, _ := proto.Marshal(c.buildPttShortVideoProto(target, videoSum, thumbSum, videoLen, thumbLen).PttShortVideoUploadReq)
-	combined := utils.MultiReadSeeker(thumb, video)
-	input := highway.BdhInput{
+	_, _ = thumb.Seek(0, io.SeekStart)
+	_, _ = video.Seek(0, io.SeekStart)
+	combined := io.MultiReader(thumb, video)
+	input := highway.Transaction{
 		CommandID: cmd,
 		Body:      combined,
 		Size:      videoLen + thumbLen,
@@ -166,11 +167,7 @@ func (c *QQClient) UploadShortVideo(target message.Source, video, thumb io.ReadS
 		Ext:       ext,
 		Encrypt:   true,
 	}
-	if thread > 1 {
-		hwRsp, err = c.highwaySession.UploadBDHMultiThread(input, thread)
-	} else {
-		hwRsp, err = c.highwaySession.UploadBDH(input)
-	}
+	hwRsp, err = c.highwaySession.Upload(input)
 	if err != nil {
 		return nil, errors.Wrap(err, "upload video file error")
 	}
@@ -260,7 +257,7 @@ func (c *QQClient) buildPttShortVideoProto(target message.Source, videoHash, thu
 			ChatType:   chatType,
 			ClientType: 2,
 			Info: &pttcenter.ShortVideoFileInfo{
-				FileName:      hex.EncodeToString(videoHash) + ".mp4",
+				FileName:      fmt.Sprintf("%x.mp4", videoHash),
 				FileMd5:       videoHash,
 				ThumbFileMd5:  thumbHash,
 				FileSize:      videoSize,
@@ -324,9 +321,9 @@ func (c *QQClient) buildC2CPttStoreBDHExt(target int64, md5 []byte, size, voiceL
 }
 
 // PttCenterSvr.ShortVideoDownReq
-func decodePttShortVideoDownResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (interface{}, error) {
+func decodePttShortVideoDownResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	rsp := pttcenter.ShortVideoRspBody{}
-	if err := proto.Unmarshal(payload, &rsp); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if rsp.PttShortVideoDownloadRsp == nil || rsp.PttShortVideoDownloadRsp.DownloadAddr == nil {
@@ -336,9 +333,9 @@ func decodePttShortVideoDownResponse(_ *QQClient, _ *network.IncomingPacketInfo,
 }
 
 // PttCenterSvr.GroupShortVideoUpReq
-func decodeGroupShortVideoUploadResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (interface{}, error) {
+func decodeGroupShortVideoUploadResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	rsp := pttcenter.ShortVideoRspBody{}
-	if err := proto.Unmarshal(payload, &rsp); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if rsp.PttShortVideoUploadRsp == nil {

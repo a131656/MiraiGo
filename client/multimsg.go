@@ -2,14 +2,18 @@ package client
 
 import (
 	"bytes"
+	"crypto/md5"
 	"fmt"
 	"math"
+	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/Mrs4s/MiraiGo/binary"
+	"github.com/Mrs4s/MiraiGo/client/internal/highway"
 	"github.com/Mrs4s/MiraiGo/client/internal/network"
 	"github.com/Mrs4s/MiraiGo/client/pb/longmsg"
 	"github.com/Mrs4s/MiraiGo/client/pb/msg"
@@ -47,9 +51,9 @@ func (c *QQClient) buildMultiApplyUpPacket(data, hash []byte, buType int32, grou
 }
 
 // MultiMsg.ApplyUp
-func decodeMultiApplyUpResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (interface{}, error) {
+func decodeMultiApplyUpResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	body := multimsg.MultiRspBody{}
-	if err := proto.Unmarshal(payload, &body); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if len(body.MultimsgApplyupRsp) == 0 {
@@ -87,21 +91,29 @@ func (c *QQClient) buildMultiApplyDownPacket(resID string) (uint16, []byte) {
 }
 
 // MultiMsg.ApplyDown
-func decodeMultiApplyDownResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (interface{}, error) {
+func decodeMultiApplyDownResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	body := multimsg.MultiRspBody{}
-	if err := proto.Unmarshal(payload, &body); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if len(body.MultimsgApplydownRsp) == 0 {
-		return nil, errors.New("not found")
+		return nil, errors.New("message not found")
 	}
 	rsp := body.MultimsgApplydownRsp[0]
+
+	if rsp.ThumbDownPara == nil {
+		return nil, errors.New("message not found")
+	}
 
 	var prefix string
 	if rsp.MsgExternInfo != nil && rsp.MsgExternInfo.ChannelType == 2 {
 		prefix = "https://ssl.htdata.qq.com"
 	} else {
-		prefix = fmt.Sprintf("http://%s:%d", binary.UInt32ToIPV4Address(uint32(rsp.Uint32DownIp[0])), body.MultimsgApplydownRsp[0].Uint32DownPort[0])
+		ma := body.MultimsgApplydownRsp[0]
+		if len(rsp.Uint32DownIp) == 0 || len(ma.Uint32DownPort) == 0 {
+			return nil, errors.New("message not found")
+		}
+		prefix = fmt.Sprintf("http://%s:%d", binary.UInt32ToIPV4Address(uint32(rsp.Uint32DownIp[0])), ma.Uint32DownPort[0])
 	}
 	b, err := utils.HttpGetBytes(fmt.Sprintf("%s%s", prefix, string(rsp.ThumbDownPara)), "")
 	if err != nil {
@@ -145,9 +157,9 @@ func (l *forwardMsgLinker) link(name string) *message.ForwardMessage {
 	}
 	nodes := make([]*message.ForwardNode, 0, len(item.Buffer.Msg))
 	for _, m := range item.Buffer.Msg {
-		name := m.Head.GetFromNick()
-		if m.Head.GetMsgType() == 82 && m.Head.GroupInfo != nil {
-			name = m.Head.GroupInfo.GetGroupCard()
+		name := m.Head.FromNick.Unwrap()
+		if m.Head.MsgType.Unwrap() == 82 && m.Head.GroupInfo != nil {
+			name = m.Head.GroupInfo.GroupCard.Unwrap()
 		}
 
 		msgElems := message.ParseMessageElems(m.Body.RichText.Elems)
@@ -159,10 +171,15 @@ func (l *forwardMsgLinker) link(name string) *message.ForwardMessage {
 			}
 		}
 
+		gid := int64(0) // 给群号一个缺省值0，防止在读合并转发的私聊内容时候会报错
+		if m.Head.GroupInfo != nil {
+			gid = m.Head.GroupInfo.GroupCode.Unwrap()
+		}
 		nodes = append(nodes, &message.ForwardNode{
-			SenderId:   m.Head.GetFromUin(),
+			GroupId:    gid,
+			SenderId:   m.Head.FromUin.Unwrap(),
 			SenderName: name,
-			Time:       m.Head.GetMsgTime(),
+			Time:       m.Head.MsgTime.Unwrap(),
 			Message:    msgElems,
 		})
 	}
@@ -178,9 +195,9 @@ func (c *QQClient) GetForwardMessage(resID string) *message.ForwardMessage {
 		items: make(map[string]*msg.PbMultiMsgItem),
 	}
 	for _, item := range m.Items {
-		linker.items[item.GetFileName()] = item
+		linker.items[item.FileName.Unwrap()] = item
 	}
-	return linker.link(m.FileName)
+	return linker.link("MultiMsg")
 }
 
 func (c *QQClient) DownloadForwardMessage(resId string) *message.ForwardElement {
@@ -195,9 +212,9 @@ func (c *QQClient) DownloadForwardMessage(resId string) *message.ForwardElement 
 	var pv bytes.Buffer
 	for i := 0; i < int(math.Min(4, float64(len(multiMsg.Msg)))); i++ {
 		m := multiMsg.Msg[i]
-		sender := m.Head.GetFromNick()
-		if m.Head.GetMsgType() == 82 && m.Head.GroupInfo != nil {
-			sender = m.Head.GroupInfo.GetGroupCard()
+		sender := m.Head.FromNick.Unwrap()
+		if m.Head.MsgType.Unwrap() == 82 && m.Head.GroupInfo != nil {
+			sender = m.Head.GroupInfo.GroupCard.Unwrap()
 		}
 		brief := message.ToReadableString(message.ParseMessageElems(multiMsg.Msg[i].Body.RichText.Elems))
 		fmt.Fprintf(&pv, `<title size="26" color="#777777">%s: %s</title>`, sender, brief)
@@ -227,4 +244,82 @@ func forwardDisplay(resID, fileName, preview, summary string) string {
 	// todo: 私聊的聊天记录？
 	sb.WriteString(`</summary></item><source name="聊天记录"></source></msg>`)
 	return sb.String()
+}
+
+func (c *QQClient) NewForwardMessageBuilder(groupCode int64) *ForwardMessageBuilder {
+	return &ForwardMessageBuilder{
+		c:         c,
+		groupCode: groupCode,
+	}
+}
+
+type ForwardMessageBuilder struct {
+	c         *QQClient
+	groupCode int64
+	objs      []*msg.PbMultiMsgItem
+}
+
+// NestedNode 返回一个嵌套转发节点，其内容将会被 Builder 重定位
+func (builder *ForwardMessageBuilder) NestedNode() *message.ForwardElement {
+	filename := strconv.FormatInt(time.Now().UnixNano(), 10) // 大概率不会重复
+	return &message.ForwardElement{FileName: filename}
+}
+
+// Link 将真实的消息内容填充 reloc
+func (builder *ForwardMessageBuilder) Link(reloc *message.ForwardElement, fmsg *message.ForwardMessage) {
+	seq := builder.c.nextGroupSeq()
+	m := fmsg.PackForwardMessage(seq, rand.Int31(), builder.groupCode)
+	builder.objs = append(builder.objs, &msg.PbMultiMsgItem{
+		FileName: proto.String(reloc.FileName),
+		Buffer: &msg.PbMultiMsgNew{
+			Msg: m,
+		},
+	})
+	reloc.Content = forwardDisplay("", reloc.FileName, fmsg.Preview(), fmt.Sprintf("查看 %d 条转发消息", fmsg.Length()))
+}
+
+// Main 最外层的转发消息, 调用该方法后即上传消息
+func (builder *ForwardMessageBuilder) Main(m *message.ForwardMessage) *message.ForwardElement {
+	if m.Length() > 200 {
+		return nil
+	}
+	c := builder.c
+	seq := c.nextGroupSeq()
+	fm := m.PackForwardMessage(seq, rand.Int31(), builder.groupCode)
+	const filename = "MultiMsg"
+	builder.objs = append(builder.objs, &msg.PbMultiMsgItem{
+		FileName: proto.String(filename),
+		Buffer: &msg.PbMultiMsgNew{
+			Msg: fm,
+		},
+	})
+	trans := &msg.PbMultiMsgTransmit{
+		Msg:        fm,
+		PbItemList: builder.objs,
+	}
+	b, _ := proto.Marshal(trans)
+	data := binary.GZipCompress(b)
+	hash := md5.Sum(data)
+	rsp, body, err := c.multiMsgApplyUp(builder.groupCode, data, hash[:], 2)
+	if err != nil {
+		return nil
+	}
+	content := forwardDisplay(rsp.MsgResid, utils.RandomString(32), m.Preview(), fmt.Sprintf("查看 %d 条转发消息", m.Length()))
+	bodyHash := md5.Sum(body)
+	input := highway.Transaction{
+		CommandID: 27,
+		Ticket:    rsp.MsgSig,
+		Body:      bytes.NewReader(body),
+		Sum:       bodyHash[:],
+		Size:      int64(len(body)),
+	}
+	_, err = c.highwaySession.Upload(input)
+	if err != nil {
+		return nil
+	}
+	return &message.ForwardElement{
+		FileName: filename,
+		Content:  content,
+		ResId:    rsp.MsgResid,
+	}
 }
